@@ -1,8 +1,6 @@
-streamlit
-pandas
-numpy
-matplotlib
-wordcloud
-google-api-python-client
-pillow
-kiwipiepy
+streamlit>=1.30.0
+google-api-python-client>=2.0.0
+pandas>=2.0.0
+matplotlib>=3.5.0
+wordcloud>=1.9.0
+requests>=2.25.0
