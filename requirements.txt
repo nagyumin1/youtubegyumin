@@ -4,6 +4,5 @@ numpy
 matplotlib
 wordcloud
 google-api-python-client
-konlpy
-scikit-learn
 pillow
+kiwipiepy
