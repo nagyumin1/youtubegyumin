@@ -1,313 +1,162 @@
 import streamlit as st
+import googleapiclient.discovery
+import googleapiclient.errors
 import pandas as pd
 import re
-from collections import Counter
-
-from googleapiclient.discovery import build
-
-from konlpy.tag import Okt
+import os
+import requests
 from wordcloud import WordCloud
-
 import matplotlib.pyplot as plt
 
-# -----------------------
-# 페이지 설정
-# -----------------------
-st.set_page_config(
-    page_title="유튜브 댓글 분석기",
-    page_icon="📊",
-    layout="wide"
-)
+# -----------------------------------------------------
+# [한글 폰트 설정] 스트림릿 클라우드 환경을 위한 폰트 다운로드 함수
+# -----------------------------------------------------
+@st.cache_data
+def download_korean_font():
+    font_url = "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
+    font_path = "NanumGothic-Regular.ttf"
+    if not os.path.exists(font_path):
+        response = requests.get(font_url)
+        with open(font_path, "wb") as f:
+            f.write(response.content)
+    return font_path
 
-st.title("📊 유튜브 댓글 심층 분석기")
-
-# -----------------------
-# API KEY
-# -----------------------
-api_key = st.text_input(
-    "YouTube API Key",
-    type="password"
-)
-
-video_url = st.text_input(
-    "유튜브 링크 입력"
-)
-
-max_comments = st.slider(
-    "수집할 댓글 수",
-    100,
-    1000,
-    500,
-    100
-)
-
-# -----------------------
-# 영상 ID 추출
-# -----------------------
+# -----------------------------------------------------
+# 유튜브 API 호출 및 댓글 수집 함수
+# -----------------------------------------------------
 def extract_video_id(url):
-    patterns = [
-        r"v=([^&]+)",
-        r"youtu\.be/([^?]+)"
-    ]
+    """유튜브 URL에서 Video ID 추출"""
+    pattern = r'(?:v=|\/v\/|youtu\.be\/|\/embed\/)([a-zA-Z0-9_-]{11})'
+    match = re.search(pattern, url)
+    return match.group(1) if match else None
 
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
-
-    return None
-
-# -----------------------
-# 댓글 수집
-# -----------------------
-def get_comments(video_id, api_key, limit):
-
-    youtube = build(
-        "youtube",
-        "v3",
-        developerKey=api_key
+def get_youtube_comments(api_key, video_id, max_results=100):
+    """유튜브 API를 사용해 댓글 수집"""
+    youtube = googleapiclient.discovery.build(
+        "youtube", "v3", developerKey=api_key
     )
-
+    
     comments = []
-    next_page_token = None
-
-    while len(comments) < limit:
-
+    try:
         request = youtube.commentThreads().list(
             part="snippet",
             videoId=video_id,
-            maxResults=100,
-            pageToken=next_page_token,
+            maxResults=min(max_results, 100), # 한 번의 요청당 최대 100개
             textFormat="plainText"
         )
-
-        response = request.execute()
-
-        for item in response["items"]:
-
-            text = item["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
-
-            comments.append(text)
-
-            if len(comments) >= limit:
+        
+        while request and len(comments) < max_results:
+            response = request.execute()
+            for item in response['items']:
+                comment = item['snippet']['topLevelComment']['snippet']['textDisplay']
+                like_count = item['snippet']['topLevelComment']['snippet']['likeCount']
+                author = item['snippet']['topLevelComment']['snippet']['authorDisplayName']
+                comments.append({
+                    "작성자": author,
+                    "댓글내용": comment,
+                    "좋아요수": like_count
+                })
+            
+            # 다음 페이지가 있고 목표 수량을 채우지 못했다면 계속 수집
+            if 'nextPageToken' in response and len(comments) < max_results:
+                request = youtube.commentThreads().list(
+                    part="snippet",
+                    videoId=video_id,
+                    pageToken=response['nextPageToken'],
+                    maxResults=min(max_results - len(comments), 100),
+                    textFormat="plainText"
+                )
+            else:
                 break
+                
+        return pd.DataFrame(comments)
+    except googleapiclient.errors.HttpError as e:
+        st.error(f"유튜브 API 오류가 발생했습니다: {e}")
+        return None
+    except Exception as e:
+        st.error(f"오류 발생: {e}")
+        return None
 
-        next_page_token = response.get("nextPageToken")
+# -----------------------------------------------------
+# 스트림릿 UI 구성
+# -----------------------------------------------------
+st.set_page_config(page_title="유튜브 댓글 심도 분석기", layout="wide")
 
-        if not next_page_token:
-            break
+st.title("📊 유튜브 댓글 심도 분석 및 워드 클라우드")
+st.markdown("유튜브 링크와 API 키를 입력하여 대중의 반응을 분석해 보세요.")
 
-    return comments
+# 사이드바 설정
+st.sidebar.header("🔑 설정 및 입력")
+api_key = st.sidebar.text_input("YouTube API Key를 입력하세요", type="password")
+video_url = st.sidebar.text_input("유튜브 영상 링크(URL)를 입력하세요")
+max_comments = st.sidebar.slider("수집할 최대 댓글 수", min_value=50, max_value=500, value=100, step=50)
 
-# -----------------------
-# 감성 분석
-# -----------------------
-positive_words = [
-    "좋다","좋아요","최고","재밌다",
-    "사랑","감사","행복","대박",
-    "멋지다","훌륭"
-]
+# 한글 폰트 사전 확보
+font_path = download_korean_font()
 
-negative_words = [
-    "별로","최악","싫다",
-    "실망","망했다","구리다",
-    "짜증","노잼","아쉽다"
-]
-
-def sentiment(comment):
-
-    score = 0
-
-    for w in positive_words:
-        if w in comment:
-            score += 1
-
-    for w in negative_words:
-        if w in comment:
-            score -= 1
-
-    if score > 0:
-        return "긍정"
-
-    elif score < 0:
-        return "부정"
-
-    return "중립"
-
-# -----------------------
-# 분석 시작
-# -----------------------
-if st.button("분석 시작"):
-
+if st.sidebar.button("🚀 댓글 수집 및 분석 시작"):
     if not api_key:
-        st.error("API 키 입력")
-        st.stop()
-
-    video_id = extract_video_id(video_url)
-
-    if not video_id:
-        st.error("유튜브 링크 오류")
-        st.stop()
-
-    with st.spinner("댓글 수집중..."):
-
-        comments = get_comments(
-            video_id,
-            api_key,
-            max_comments
-        )
-
-    if len(comments) == 0:
-        st.warning("댓글 없음")
-        st.stop()
-
-    df = pd.DataFrame({
-        "댓글": comments
-    })
-
-    st.success(f"{len(df)}개 댓글 수집 완료")
-
-    # -----------------------
-    # 감성 분석
-    # -----------------------
-    df["감성"] = df["댓글"].apply(sentiment)
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric(
-            "긍정",
-            len(df[df["감성"]=="긍정"])
-        )
-
-    with col2:
-        st.metric(
-            "부정",
-            len(df[df["감성"]=="부정"])
-        )
-
-    with col3:
-        st.metric(
-            "중립",
-            len(df[df["감성"]=="중립"])
-        )
-
-    # -----------------------
-    # 감성 분포
-    # -----------------------
-    st.subheader("감성 분포")
-
-    fig, ax = plt.subplots()
-
-    df["감성"].value_counts().plot(
-        kind="bar",
-        ax=ax
-    )
-
-    st.pyplot(fig)
-
-    # -----------------------
-    # 형태소 분석
-    # -----------------------
-    st.subheader("단어 분석")
-
-    import re
-
-    words = []
-
-    for comment in comments:
-
-        nouns = okt.nouns(comment)
-
-        words.extend([
-            n for n in nouns
-            if len(n) >= 2
-        ])
-
-    word_count = Counter(words)
-
-    top_words = pd.DataFrame(
-        word_count.most_common(20),
-        columns=["단어","횟수"]
-    )
-
-    st.dataframe(
-        top_words,
-        use_container_width=True
-    )
-
-    # -----------------------
-    # 워드클라우드
-    # -----------------------
-    st.subheader("☁️ 워드클라우드")
-
-    try:
-
-        wc = WordCloud(
-            font_path="NanumGothic.ttf",
-            width=1200,
-            height=600,
-            background_color="white"
-        )
-
-        wc.generate_from_frequencies(
-            word_count
-        )
-
-        fig, ax = plt.subplots(
-            figsize=(14,7)
-        )
-
-        ax.imshow(wc)
-
-        ax.axis("off")
-
-        st.pyplot(fig)
-
-    except Exception:
-
-        st.warning(
-            "NanumGothic.ttf 업로드 필요"
-        )
-
-    # -----------------------
-    # 댓글 길이 분석
-    # -----------------------
-    st.subheader("댓글 길이 분석")
-
-    df["길이"] = df["댓글"].apply(len)
-
-    fig, ax = plt.subplots()
-
-    ax.hist(df["길이"], bins=20)
-
-    st.pyplot(fig)
-
-    # -----------------------
-    # 자주 등장 댓글
-    # -----------------------
-    st.subheader("자주 등장한 댓글")
-
-    top_comments = pd.DataFrame(
-        Counter(comments).most_common(20),
-        columns=["댓글","횟수"]
-    )
-
-    st.dataframe(
-        top_comments,
-        use_container_width=True
-    )
-
-    # -----------------------
-    # 다운로드
-    # -----------------------
-    csv = df.to_csv(
-        index=False
-    ).encode("utf-8-sig")
-
-    st.download_button(
-        "CSV 다운로드",
-        csv,
-        "youtube_comments.csv",
-        "text/csv"
-    )
+        st.warning("API Key를 입력해주세요.")
+    elif not video_url:
+        st.warning("유튜브 영상 링크를 입력해주세요.")
+    else:
+        video_id = extract_video_id(video_url)
+        
+        if not video_id:
+            st.error("올바른 유튜브 URL 형식이 아닙니다.")
+        else:
+            with st.spinner("유튜브에서 댓글을 열심히 가져오는 중..."):
+                df = get_youtube_comments(api_key, video_id, max_comments)
+                
+            if df is not None and not df.empty:
+                st.success(f"총 {len(df)}개의 댓글을 성공적으로 수집했습니다!")
+                
+                # 레이아웃 분할
+                col1, col2 = st.columns([1, 1])
+                
+                with col1:
+                    st.subheader("📝 수집된 댓글 데이터")
+                    st.dataframe(df, use_container_width=True)
+                    
+                    # 가장 좋아요를 많이 받은 댓글 탑 3
+                    st.subheader("👍 베스트 댓글 (좋아요 순)")
+                    top_likes = df.sort_values(by="좋아요수", ascending=False).head(3)
+                    for idx, row in top_likes.iterrows():
+                        st.info(f"**{row['작성자']}** (👍 {row['좋아요수']}개)\n\n{row['댓글내용']}")
+                
+                with col2:
+                    st.subheader("☁️ 한글 워드 클라우드 분석")
+                    
+                    # 텍스트 전처리 (한글, 영문, 공백만 남기기)
+                    all_text = " ".join(df["댓글내용"].astype(str))
+                    cleaned_text = re.sub(r'[^가-힣a-zA-Z\s]', '', all_text)
+                    
+                    if len(cleaned_text.strip()) > 0:
+                        # 워드클라우드 생성 (무료 나눔고딕 폰트 경로 적용)
+                        wordcloud = WordCloud(
+                            font_path=font_path,
+                            background_color="white",
+                            width=800,
+                            height=600,
+                            max_words=100,
+                            colormap='viridis'
+                        ).generate(cleaned_text)
+                        
+                        # matplotlib로 스트림릿에 시각화 표출
+                        fig, ax = plt.subplots(figsize=(10, 7))
+                        ax.imshow(wordcloud, interpolation='bilinear')
+                        ax.axis("off")
+                        st.pyplot(fig)
+                    else:
+                        st.warning("분석할 만한 유효한 텍스트 단어가 부족합니다.")
+                        
+                    # 간단한 통계 요약
+                    st.subheader("📊 댓글 핵심 통계")
+                    total_likes = df["좋아요수"].sum()
+                    avg_likes = df["좋아요수"].mean()
+                    
+                    st.metric(label="총 좋아요 수", value=f"{total_likes}개")
+                    st.metric(label="댓글당 평균 좋아요 수", value=f"{avg_likes:.2f}개")
+                    
+            elif df is not None and df.empty:
+                st.warning("이 영상에는 댓글이 없거나 댓글 기능이 중지되어 있습니다.")
