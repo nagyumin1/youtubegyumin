@@ -211,7 +211,7 @@ if st.button("분석 시작"):
     # -----------------------
     st.subheader("단어 분석")
 
-    okt = Okt()
+    import re
 
     words = []
 
